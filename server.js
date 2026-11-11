@@ -14,129 +14,133 @@ const io = new Server(server, {
     }
 });
 
-// Armazena as salas ativas separadas por ID do jogo
+// Armazena as salas ativas por sessionid
 const rooms = {};
 
 app.get('/', (req, res) => {
-    res.send('Servidor Oficial Netplay Super Bomberman 4 Online!');
+    res.send('Servidor Netplay Super Bomberman 4 Online!');
+});
+
+// 1. Rota HTTP que o EmulatorJS consulta para listar as salas abertas
+app.get('/list', (req, res) => {
+    const gameId = req.query.game_id;
+    const result = {};
+
+    for (const sessionId in rooms) {
+        const room = rooms[sessionId];
+        if (!gameId || String(room.game_id) === String(gameId)) {
+            result[sessionId] = {
+                room_name: room.room_name,
+                player_name: room.player_name,
+                hasPassword: !!room.password,
+                current: room.players.length,
+                max: room.maxPlayers
+            };
+        }
+    }
+
+    res.json(result);
 });
 
 io.on('connection', (socket) => {
-    let currentRoom = null;
-    let currentGameId = null;
+    let currentSessionId = null;
 
-    // 1. Quando o emulador pede a lista de salas disponíveis
-    socket.on('get-rooms', (data, callback) => {
-        const gameId = data.game_id || 'default';
-        const gameRooms = rooms[gameId] || {};
-        const roomList = [];
+    // 2. Evento oficial que o EmulatorJS dispara ao criar uma sala
+    socket.on('open-room', (data, callback) => {
+        const extra = data.extra || {};
+        const sessionId = extra.sessionid || socket.id;
 
-        for (const roomName in gameRooms) {
-            const room = gameRooms[roomName];
-            roomList.push({
-                room_name: roomName,
-                player_name: room.ownerName,
-                has_password: !!room.password,
-                current_players: room.players.length,
-                max_players: room.maxPlayers || 4
-            });
-        }
-
-        if (typeof callback === 'function') {
-            callback(roomList);
-        }
-    });
-
-    // 2. Quando o jogador cria uma nova sala
-    socket.on('create-room', (data, callback) => {
-        const gameId = data.game_id || 'default';
-        const roomName = data.room_name;
-
-        if (!rooms[gameId]) rooms[gameId] = {};
-
-        if (rooms[gameId][roomName]) {
-            if (typeof callback === 'function') {
-                callback({ error: 'Já existe uma sala com esse nome!' });
-            }
+        if (rooms[sessionId]) {
+            if (typeof callback === 'function') callback('Já existe uma sala com esse ID!');
             return;
         }
 
-        rooms[gameId][roomName] = {
+        rooms[sessionId] = {
+            sessionid: sessionId,
             owner: socket.id,
-            ownerName: data.player_name || 'Jogador 1',
+            room_name: extra.room_name || 'Sala Bomberman',
+            player_name: extra.player_name || 'Jogador 1',
+            game_id: extra.game_id || '404',
             password: data.password || null,
-            maxPlayers: data.max_players || 4,
-            players: [{ id: socket.id, name: data.player_name || 'Jogador 1' }]
+            maxPlayers: data.maxPlayers || 4,
+            players: [socket.id]
         };
 
-        currentRoom = roomName;
-        currentGameId = gameId;
-        socket.join(`${gameId}_${roomName}`);
+        currentSessionId = sessionId;
+        socket.join(sessionId);
 
         if (typeof callback === 'function') {
-            callback({ success: true });
+            callback(null); // null significa sucesso no protocolo do EmulatorJS
         }
     });
 
-    // 3. Quando outro jogador tenta entrar na sala
+    // 3. Evento oficial quando outro jogador entra na sala
     socket.on('join-room', (data, callback) => {
-        const gameId = data.game_id || 'default';
-        const roomName = data.room_name;
-        const room = rooms[gameId]?.[roomName];
+        const extra = data.extra || {};
+        const sessionId = extra.sessionid;
+        const room = rooms[sessionId];
 
         if (!room) {
-            if (typeof callback === 'function') callback({ error: 'Sala não encontrada!' });
+            if (typeof callback === 'function') callback('Sala não encontrada!');
             return;
         }
 
         if (room.password && room.password !== data.password) {
-            if (typeof callback === 'function') callback({ error: 'Senha incorreta!' });
+            if (typeof callback === 'function') callback('Senha incorreta!');
             return;
         }
 
         if (room.players.length >= room.maxPlayers) {
-            if (typeof callback === 'function') callback({ error: 'A sala está cheia!' });
+            if (typeof callback === 'function') callback('A sala está cheia!');
             return;
         }
 
-        room.players.push({ id: socket.id, name: data.player_name || 'Jogador' });
-        currentRoom = roomName;
-        currentGameId = gameId;
-        socket.join(`${gameId}_${roomName}`);
+        room.players.push(socket.id);
+        currentSessionId = sessionId;
+        socket.join(sessionId);
 
-        // Avisa o dono da sala que alguém entrou para iniciar a conexão WebRTC
-        io.to(room.owner).emit('user-connected', {
-            id: socket.id,
-            name: data.player_name || 'Jogador'
+        // Avisa os participantes da sala sobre o novo jogador
+        socket.to(sessionId).emit('user-connected', {
+            userid: extra.userid || socket.id,
+            player_name: extra.player_name || 'Jogador'
         });
 
         if (typeof callback === 'function') {
-            callback({ success: true, owner: room.owner });
+            callback(null);
         }
     });
 
-    // 4. Troca de dados de conexão direta (WebRTC) entre os jogadores
-    socket.on('signal', (data) => {
-        io.to(data.to).emit('signal', {
-            from: socket.id,
-            signal: data.signal
-        });
+    // 4. Repasse de sinais WebRTC e dados da partida entre os jogadores
+    socket.on('webrtc-signal', (data) => {
+        if (currentSessionId) {
+            socket.to(currentSessionId).emit('webrtc-signal', data);
+        }
     });
 
-    // 5. Limpeza automática quando o jogador fecha a aba ou sai
-    socket.on('disconnect', () => {
-        if (currentGameId && currentRoom && rooms[currentGameId]?.[currentRoom]) {
-            const room = rooms[currentGameId][currentRoom];
-            room.players = room.players.filter(p => p.id !== socket.id);
+    socket.on('data-message', (data) => {
+        if (currentSessionId) {
+            socket.to(currentSessionId).emit('data-message', data);
+        }
+    });
+
+    // 5. Fecha ou limpa a sala quando alguém sai
+    const sairDaSala = () => {
+        if (currentSessionId && rooms[currentSessionId]) {
+            const room = rooms[currentSessionId];
+            room.players = room.players.filter(id => id !== socket.id);
 
             if (room.owner === socket.id || room.players.length === 0) {
-                delete rooms[currentGameId][currentRoom];
-                io.to(`${currentGameId}_${currentRoom}`).emit('room-closed');
+                delete rooms[currentSessionId];
+                io.to(currentSessionId).emit('room-closed');
             } else {
-                io.to(`${currentGameId}_${currentRoom}`).emit('user-disconnected', socket.id);
+                socket.to(currentSessionId).emit('user-disconnected', socket.id);
             }
+            currentSessionId = null;
         }
-    });
+    };
+
+    socket.on('leave-room', sairDaSala);
+    socket.on('disconnect', sairDaSala);
 });
 
 const PORT = process.env.PORT || 3000;
