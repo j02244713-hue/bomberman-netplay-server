@@ -1,9 +1,7 @@
 import socketio
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
 
-# 1. Configura o Socket.IO e o FastAPI com CORS totalmente liberado
 sio = socketio.AsyncServer(async_mode='asgi', cors_allowed_origins='*')
 app = FastAPI()
 
@@ -21,7 +19,6 @@ rooms = {}
 async def root():
     return {"status": "Servidor Python Netplay Super Bomberman 4 Online!"}
 
-# 2. Rota HTTP que o EmulatorJS consulta para listar as salas
 @app.get("/list")
 async def list_rooms(game_id: str = None, domain: str = None):
     result = {}
@@ -38,10 +35,16 @@ async def list_rooms(game_id: str = None, domain: str = None):
             }
     return result
 
-# 3. Eventos do Socket.IO exigidos pelo EmulatorJS
+# Função auxiliar que descobre em qual sala o jogador está e repassa a mensagem
+async def repassar_para_sala(sid, evento, data):
+    for session_id, room in rooms.items():
+        if sid in room["players"]:
+            await sio.emit(evento, data, room=session_id, skip_sid=sid)
+            break
+
 @sio.event
 async def connect(sid, environ):
-    print(f"Jogador conectado: {sid}")
+    print(f"Conectado: {sid}")
 
 @sio.on("open-room")
 async def open_room(sid, data):
@@ -49,7 +52,7 @@ async def open_room(sid, data):
     session_id = extra.get("sessionid", sid)
 
     if session_id in rooms:
-        return "Já existe uma sala com esse ID!"
+        return "Sala já existe!"
 
     rooms[session_id] = {
         "sessionid": session_id,
@@ -64,7 +67,7 @@ async def open_room(sid, data):
     }
 
     await sio.enter_room(sid, session_id)
-    return None  # None = sucesso no protocolo do EmulatorJS
+    return None
 
 @sio.on("join-room")
 async def join_room(sid, data):
@@ -77,31 +80,42 @@ async def join_room(sid, data):
     if room.get("password") and room.get("password") != data.get("password"):
         return "Senha incorreta!"
     if len(room["players"]) >= room["maxPlayers"]:
-        return "A sala está cheia!"
+        return "Sala cheia!"
 
     room["players"].append(sid)
     await sio.enter_room(sid, session_id)
 
-    await sio.emit("user-connected", {
+    # Notifica o dono da sala com todos os formatos esperados pelo EmulatorJS
+    payload = {
         "userid": extra.get("userid", sid),
-        "player_name": extra.get("player_name", "Jogador")
-    }, room=session_id, skip_sid=sid)
+        "player_name": extra.get("player_name", "Jogador"),
+        "extra": extra
+    }
+    await sio.emit("user-connected", payload, room=session_id, skip_sid=sid)
+    await sio.emit("join-room", data, room=session_id, skip_sid=sid)
 
     return None
 
+# Repassa todos os possíveis canais de negociação WebRTC entre Jogador 1 e Jogador 2
 @sio.on("webrtc-signal")
-async def webrtc_signal(sid, data):
-    for session_id, room in rooms.items():
-        if sid in room["players"]:
-            await sio.emit("webrtc-signal", data, room=session_id, skip_sid=sid)
-            break
+async def on_webrtc_signal(sid, data):
+    await repassar_para_sala(sid, "webrtc-signal", data)
 
 @sio.on("data-message")
-async def data_message(sid, data):
-    for session_id, room in rooms.items():
-        if sid in room["players"]:
-            await sio.emit("data-message", data, room=session_id, skip_sid=sid)
-            break
+async def on_data_message(sid, data):
+    await repassar_para_sala(sid, "data-message", data)
+
+@sio.on("message")
+async def on_message(sid, data):
+    await repassar_para_sala(sid, "message", data)
+
+@sio.on("rtcmulticonnection")
+async def on_rtc(sid, data):
+    await repassar_para_sala(sid, "rtcmulticonnection", data)
+
+@sio.on("changed-uuid")
+async def on_uuid(sid, data):
+    await repassar_para_sala(sid, "changed-uuid", data)
 
 @sio.event
 async def disconnect(sid):
@@ -117,5 +131,4 @@ async def disconnect(sid):
     for session_id in to_delete:
         del rooms[session_id]
 
-# 4. A LINHA MAIS IMPORTANTE: Une o Socket.IO ao FastAPI para responder /socket.io/
 socket_app = socketio.ASGIApp(sio, other_asgi_app=app)
