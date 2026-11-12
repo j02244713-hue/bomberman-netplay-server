@@ -35,13 +35,6 @@ async def list_rooms(game_id: str = None, domain: str = None):
             }
     return result
 
-# Função auxiliar que descobre em qual sala o jogador está e repassa a mensagem
-async def repassar_para_sala(sid, evento, data):
-    for session_id, room in rooms.items():
-        if sid in room["players"]:
-            await sio.emit(evento, data, room=session_id, skip_sid=sid)
-            break
-
 @sio.event
 async def connect(sid, environ):
     print(f"Conectado: {sid}")
@@ -82,40 +75,34 @@ async def join_room(sid, data):
     if len(room["players"]) >= room["maxPlayers"]:
         return "Sala cheia!"
 
-    room["players"].append(sid)
+    if sid not in room["players"]:
+        room["players"].append(sid)
     await sio.enter_room(sid, session_id)
 
-    # Notifica o dono da sala com todos os formatos esperados pelo EmulatorJS
-    payload = {
-        "userid": extra.get("userid", sid),
-        "player_name": extra.get("player_name", "Jogador"),
-        "extra": extra
-    }
-    await sio.emit("user-connected", payload, room=session_id, skip_sid=sid)
+    # Envia a confirmação para quem entrou E avisa o dono da sala para abrir o túnel WebRTC
     await sio.emit("join-room", data, room=session_id, skip_sid=sid)
+    await sio.emit("user-connected", {
+        "userid": extra.get("userid", sid),
+        "player_name": extra.get("player_name", "Jogador 2"),
+        "extra": extra
+    }, room=session_id, skip_sid=sid)
 
     return None
 
-# Repassa todos os possíveis canais de negociação WebRTC entre Jogador 1 e Jogador 2
-@sio.on("webrtc-signal")
-async def on_webrtc_signal(sid, data):
-    await repassar_para_sala(sid, "webrtc-signal", data)
-
-@sio.on("data-message")
-async def on_data_message(sid, data):
-    await repassar_para_sala(sid, "data-message", data)
-
-@sio.on("message")
-async def on_message(sid, data):
-    await repassar_para_sala(sid, "message", data)
-
-@sio.on("rtcmulticonnection")
-async def on_rtc(sid, data):
-    await repassar_para_sala(sid, "rtcmulticonnection", data)
-
-@sio.on("changed-uuid")
-async def on_uuid(sid, data):
-    await repassar_para_sala(sid, "changed-uuid", data)
+# Repasse universal que mantém a estrutura original dos argumentos do EmulatorJS
+@sio.on("*")
+async def catch_all(event, sid, *args):
+    if event in ["open-room", "join-room", "connect", "disconnect"]:
+        return
+    for session_id, room in rooms.items():
+        if sid in room["players"]:
+            if len(args) == 1:
+                await sio.emit(event, args[0], room=session_id, skip_sid=sid)
+            elif len(args) > 1:
+                await sio.emit(event, args, room=session_id, skip_sid=sid)
+            else:
+                await sio.emit(event, room=session_id, skip_sid=sid)
+            break
 
 @sio.event
 async def disconnect(sid):
